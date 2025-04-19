@@ -8,6 +8,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, DistributedSampler
 import torch.distributed as dist
 import x_core_ai
+from typing import Dict, Tuple, Any, Optional
+from x_core_ai.src.utils.model_utils import analyze_model_size, load_weights
 
 class Core:
     def __init__(self, config, package_name='x_core_ai.src'):
@@ -55,6 +57,9 @@ class Core:
         if self.config.get('weights_path'):
             self.load_model_weights(self.model, self.config.get('weights_path'))
         
+        # Analyze and print model statistics
+        analyze_model_size(self.model)
+    
     def model_to_device(self):
         """Move model to appropriate device and setup distributed if needed"""
         gpus = self.config.get('gpus', [0])
