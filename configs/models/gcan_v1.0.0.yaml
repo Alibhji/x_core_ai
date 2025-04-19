@@ -1,0 +1,77 @@
+project_name: gcan_v1.0.0
+description: Gated Cross-Attention Network (GCAN) for cost prediction
+date: 2025-04-17
+author: Ali Bhji
+
+distributed: False
+dist_kwargs:
+    local_rank: 0
+    world_size: 1
+gpus: [0]
+
+dataframe_name: dummy_dataframe
+dataframe_kwargs:
+  photo_feature_sequence_length: 40
+  photo_feature_dim: 768
+  target_name: cost_target
+  target_type: regression
+  target_range: [0, 2000]
+  number_of_samples: 1000
+  storage_path: $storage_path
+
+dataset_name: photo_feature_dataset
+dataset_kwargs:
+  photo_feature_sequence_length: 40
+  photo_feature_dim: 768
+  target_name: cost_target
+  target_type: regression
+  target_range: [0, 2000]
+  train_split: 0.8
+  val_split: 0.1
+  test_split: 0.1
+  batch_size: 128
+  num_workers: 4
+  pin_memory: True
+  shuffle: True   
+  storage_path: $storage_path
+
+model_name: gated_cross_attention
+model_kwargs:
+    input_shape: [40, 768]
+    num_layers: 6
+    num_heads: 8
+    hidden_dim: 2048
+    dropout: 0.1
+
+
+trainer_kwargs:
+    epochs: 100
+    batch_size: 128
+    learning_rate: 0.001
+    weight_decay: 0.01
+    optimizer_kwargs:
+        lr: 0.001
+        weight_decay: 0.01
+        betas: [0.9, 0.999]
+        eps: 1e-8
+    scheduler_kwargs:
+        mode: "min"
+        factor: 0.1
+        patience: 10
+        verbose: True
+    early_stopping_kwargs:
+        patience: 20
+        min_delta: 0.001  
+    metrics:
+        - "mse"
+        - "mae"
+        - "r2"
+    save_dir: "checkpoints"
+    save_every: 10
+        
+root_path: C:\Users\alibh\Desktop\projects\python\x_core_ai\storage
+storage_path: r"$root_path\$project_name\data"
+model_checkpoint_path: r"$root_path\$project_name\checkpoints"
+
+
+

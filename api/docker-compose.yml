@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  # Main API service
+  xcore-api:
+    build:
+      context: ..  # Build context is the parent directory
+      dockerfile: api/Dockerfile
+    container_name: xcore-api
+    ports:
+      - "8000:8000"  # Map container port 8000 to host port 8000
+    volumes:
+      # Mount source code for development hot-reloading
+      - ../src:/app/src
+      - ./:/app/api
+    environment:
+      - PYTHONPATH=/app
+      # Enable development mode with hot reloading
+      - ENVIRONMENT=development
+    # Ensure container restarts automatically
+    restart: unless-stopped
+    # Allocate enough resources for model loading and inference
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+    # Health check to verify the API is running
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    # Display logs in real-time
+    tty: true 
