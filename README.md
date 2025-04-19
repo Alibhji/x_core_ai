@@ -12,6 +12,7 @@ Key capabilities:
 - **Forecasting**: Simplified inference for trained models 
 - **API Interface**: REST API for model deployment and integration
 - **Consistent Sequence Length**: All components use a sequence length of 40 to ensure compatibility
+- **Advanced Logging**: Configurable text logging system with enable/disable options
 
 ## Project Structure
 
@@ -25,6 +26,7 @@ x_core_ai/
 │   ├── gcn_demo.py       # Gated Cross-Attention Network demo
 │   ├── training_demo.py  # Training demonstration
 │   └── validation_demo.py# Validation demonstration
+├── logs/                 # Generated log files (when logging is enabled)
 ├── src/                  # Core source code
 │   ├── core/             # Main framework components
 │   │   ├── core_base.py  # Base class for all components
@@ -33,7 +35,9 @@ x_core_ai/
 │   │   └── validation.py # Model evaluation capabilities
 │   ├── datasets/         # Dataset implementations
 │   ├── dataframes/       # Data loading and processing
-│   └── models/           # Model architectures
+│   ├── models/           # Model architectures
+│   └── utils/            # Utility functions and classes
+│       └── logger.py     # Advanced text logger implementation
 └── sub_module/           # Supporting utilities
 ```
 
@@ -103,6 +107,38 @@ forecast = Forecast(config)
 prediction = forecast.predict(input_data)
 ```
 
+### Advanced Logger
+
+The framework includes a powerful logging system that can be enabled or disabled as needed:
+
+```python
+from src.utils import get_logger
+
+# Get logger with default settings (enabled)
+logger = get_logger()
+
+# Log various message types
+logger.info("Processing started")
+logger.warning("Resource usage high")
+logger.error("Failed to load file")
+
+# Log structured data
+logger.log_config(config)
+logger.log_metrics(metrics, prefix="Validation")
+
+# Disable logging with a configuration
+disabled_config = {"enable_logging": False}
+logger = get_logger(disabled_config)
+```
+
+Logging features:
+- Enable/disable with a simple flag
+- Log to console and/or file
+- Multiple log levels (DEBUG, INFO, WARNING, ERROR)
+- Automatic tracking of module and line numbers
+- Specialized methods for logging configurations and metrics
+- Timestamped log files
+
 ## API Interface
 
 The project includes a ready-to-use REST API for model deployment:
@@ -149,7 +185,16 @@ config = {
     "loss": "mse",
     "optimizer": "adam",
     "scheduler": "cosine",
-    "metrics": ["mse", "mae", "rmse"]
+    "metrics": ["mse", "mae", "rmse"],
+    
+    # Logging configuration
+    "logging": {
+        "enable_logging": True,
+        "log_to_file": True,
+        "log_to_console": True,
+        "log_level": "INFO",
+        "log_dir": "logs"
+    }
 }
 ```
 
@@ -164,6 +209,14 @@ python demo/training_demo.py   # Demonstrates the training process
 python demo/validation_demo.py # Demonstrates model evaluation
 python demo/forecast_demo.py   # Demonstrates model inference
 python demo/gcn_demo.py        # Demonstrates the GCAN model
+```
+
+### Logger Example
+
+To see the logger in action:
+
+```
+python src/utils/logger_example.py
 ```
 
 ### API Quick Start
@@ -184,9 +237,10 @@ This framework is designed to be used as a template for your own AI model traini
 1. **Create your model**: Add your model architecture in `src/models/`
 2. **Create your dataset**: Add your dataset handling in `src/datasets/`
 3. **Configure**: Modify configuration settings for your specific needs
-4. **Train**: Use the `Training` class to train your model
-5. **Evaluate**: Use the `Validation` class to evaluate your model
-6. **Deploy**: Use the API or `Forecast` class for inference
+4. **Set up logging**: Enable or disable logging as needed
+5. **Train**: Use the `Training` class to train your model
+6. **Evaluate**: Use the `Validation` class to evaluate your model
+7. **Deploy**: Use the API or `Forecast` class for inference
 
 ## Why Use This Template?
 
@@ -195,6 +249,7 @@ This framework is designed to be used as a template for your own AI model traini
 - **Scalability**: Designed to work with distributed training
 - **Extensibility**: Simple to add custom metrics, models, or datasets
 - **Deployment-Ready**: Includes a production-ready API for model serving
+- **Complete Logging**: Advanced text logging with configurable options
 
 ## Contributing
 
