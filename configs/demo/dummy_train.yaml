@@ -1,0 +1,70 @@
+project_name: training_demo
+description: Dummy configuration for training demonstration
+date: 2025-04-20
+author: Ali Bhaji
+
+# System configuration
+distributed: false
+gpus: [0]
+
+# Data configuration
+data_name: dummy_dataframe
+dataframe_kwargs:
+  photo_feature_sequence_length: 40  # Use same sequence length for consistency
+  photo_feature_dim: 768  # Feature dimension of embedded photos
+  target_name: cost_target
+  target_type: regression
+  target_range: [0, 100]
+  number_of_samples: 1000
+
+# Dataset configuration
+dataset_name: photo_feature_dataset
+dataset_kwargs:
+  photo_feature_sequence_length: 40
+  photo_feature_dim: 768
+  target_name: cost_target
+
+# Model configuration
+model_name: gated_cross_attention
+model_kwargs:
+  input_shape: [40, 768]  # [sequence_length, feature_dim]
+  num_layers: 2
+  num_heads: 4
+  hidden_dim: 512
+  dropout: 0.1
+  target_name: cost_target
+
+# Training configuration
+epochs: 5
+learning_rate: 0.001
+weight_decay: 0.01
+loss: mse
+optimizer: adam
+scheduler: cosine
+metrics: [mse, mae, rmse]
+monitor_metric: mse
+save_dir: checkpoints
+save_every: 1
+early_stopping_kwargs:
+  patience: 3
+
+# Dataloader configuration
+dataloader_kwargs_train:
+  batch_size: 16
+  shuffle: true
+  num_workers: 0
+dataloader_kwargs_val:
+  batch_size: 32
+  shuffle: false
+  num_workers: 0
+
+# Experiment tracking configuration
+experiment_tracking:
+  enable: true
+  project_name: training_demo
+  version: v1.0
+  open_ui: false
+  log_artifacts: true
+  log_model: true
+  log_freq: 1
+  run_name: training_demo_run 

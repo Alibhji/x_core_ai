@@ -11,6 +11,7 @@ Key capabilities:
 - **Validation**: Comprehensive evaluation with customizable metrics
 - **Forecasting**: Simplified inference for trained models 
 - **API Interface**: REST API for model deployment and integration
+- **Interpretability**: Tools for understanding and explaining model predictions
 - **Consistent Sequence Length**: All components use a sequence length of 40 to ensure compatibility
 - **Advanced Logging**: Configurable text logging system with enable/disable options
 
@@ -24,6 +25,7 @@ x_core_ai/
 ├── demo/                 # Demo scripts for each component
 │   ├── forecast_demo.py  # Forecasting demonstration
 │   ├── gcn_demo.py       # Gated Cross-Attention Network demo
+│   ├── luid_demo.py      # Model interpretability demonstration
 │   ├── training_demo.py  # Training demonstration
 │   └── validation_demo.py# Validation demonstration
 ├── logs/                 # Generated log files (when logging is enabled)
@@ -35,6 +37,8 @@ x_core_ai/
 │   │   └── validation.py # Model evaluation capabilities
 │   ├── datasets/         # Dataset implementations
 │   ├── dataframes/       # Data loading and processing
+│   ├── interpretability/ # Model interpretability tools
+│   │   └── luid/         # Local Unified Interpretability Decoder
 │   ├── models/           # Model architectures
 │   └── utils/            # Utility functions and classes
 │       └── logger.py     # Advanced text logger implementation
@@ -105,6 +109,37 @@ forecast = Forecast(config)
 
 # Make a prediction
 prediction = forecast.predict(input_data)
+```
+
+### Interpretability Module
+
+The framework includes tools for model interpretability, with the LUID (Local Unified Interpretability Decoder) package:
+
+```python
+from src.core import Core
+from src.interpretability.luid.luid import Luid
+
+# Initialize with a trained model
+core = Core(config)
+core.model_generator()
+
+# Create the LUID interpreter
+luid = Luid(core.model, config)
+
+# Analyze feature importance
+importance = luid.analyze_feature_importance(input_data, method="shap")
+
+# Visualize the results
+vis_result = luid.visualize_importance(importance, feature_names=feature_names)
+```
+
+#### Interpretability UI
+
+The framework includes an interactive UI for exploring model interpretability:
+
+```bash
+# Run the demo and open the UI
+python demo/luid_demo.py --open-ui
 ```
 
 ### Advanced Logger
@@ -209,6 +244,15 @@ python demo/training_demo.py   # Demonstrates the training process
 python demo/validation_demo.py # Demonstrates model evaluation
 python demo/forecast_demo.py   # Demonstrates model inference
 python demo/gcn_demo.py        # Demonstrates the GCAN model
+python demo/luid_demo.py       # Demonstrates model interpretability
+```
+
+### Interactive UI for Interpretability
+
+To explore model interpretability with an interactive UI:
+
+```
+python demo/luid_demo.py --open-ui
 ```
 
 ### Logger Example
@@ -240,12 +284,14 @@ This framework is designed to be used as a template for your own AI model traini
 4. **Set up logging**: Enable or disable logging as needed
 5. **Train**: Use the `Training` class to train your model
 6. **Evaluate**: Use the `Validation` class to evaluate your model
-7. **Deploy**: Use the API or `Forecast` class for inference
+7. **Interpret**: Use the `Luid` class to understand model predictions
+8. **Deploy**: Use the API or `Forecast` class for inference
 
 ## Why Use This Template?
 
 - **Consistency**: All components use a standardized interface and configuration
 - **Modularity**: Easy to swap models, datasets, or training procedures
+- **Explainability**: Built-in tools for model interpretability
 - **Scalability**: Designed to work with distributed training
 - **Extensibility**: Simple to add custom metrics, models, or datasets
 - **Deployment-Ready**: Includes a production-ready API for model serving

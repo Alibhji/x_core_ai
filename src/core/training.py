@@ -4,11 +4,23 @@ import torch
 import numpy as np
 from .validation import Validation
 
+# Import MLflow integration from experiment_tracker
+try:
+    from ..experiment_tracker import integrate_tracker_with_core, track_training_epoch
+    _has_mlflow = True
+except ImportError:
+    _has_mlflow = False
+
 class Training(Validation):
     def __init__(self, config, package_name='x_core_ai.src'):
         """Training class for model training"""
         super().__init__(config, package_name)
         self.setup_training()
+        
+        # Setup MLflow tracking if enabled in config
+        self.tracker = None
+        if _has_mlflow and self.config.get("experiment_tracking", {}).get("enable", False):
+            self.tracker = integrate_tracker_with_core(self)
         
     def setup_training(self):
         """Setup training components"""
@@ -250,74 +262,166 @@ class Training(Validation):
             minimize_metric = False
             self.best_val_metric = -float('inf')  # For metrics where higher is better
         
+        # MLflow configuration
+        mlflow_config = self.config.get('experiment_tracking', {})
+        mlflow_enabled = mlflow_config.get('enable', False) and _has_mlflow
+        mlflow_log_freq = mlflow_config.get('log_freq', 1)
+        mlflow_log_model = mlflow_config.get('log_model', True)
+        
+        # Start MLflow run if enabled
+        if mlflow_enabled and self.tracker:
+            run_name = mlflow_config.get('run_name', self.config.get('project_name', 'training'))
+            self.tracker.start_run(run_name=run_name)
+            
+            # Log model parameters
+            model_params = self.config.get('model_kwargs', {})
+            train_params = {
+                'epochs': epochs,
+                'learning_rate': self.config.get('learning_rate', 0.001),
+                'weight_decay': self.config.get('weight_decay', 0),
+                'optimizer': self.config.get('optimizer', 'adam'),
+                'scheduler': self.config.get('scheduler', ''),
+                'loss': self.config.get('loss', 'mse'),
+                'batch_size': self.config.get('dataloader_kwargs_train', {}).get('batch_size', 32)
+            }
+            
+            if hasattr(self.tracker, 'log_params'):
+                self.tracker.log_params(model_params)
+                self.tracker.log_params(train_params)
+        
         start_time = time.time()
         
-        for epoch in range(self.current_epoch, epochs):
-            self.current_epoch = epoch
-            
-            # Train for one epoch
-            train_loss = self.train_epoch(train_dataloader)
-            
-            # Update learning rate if using step scheduler
-            if self.scheduler and not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                self.scheduler.step()
+        try:
+            for epoch in range(self.current_epoch, epochs):
+                self.current_epoch = epoch
+                epoch_start_time = time.time()
                 
-            # Validate
-            val_metrics = self.evaluate(val_dataloader)
-            
-            # Update learning rate if using plateau scheduler
-            if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                monitor_value = val_metrics.get(monitor_metric, train_loss)
-                self.scheduler.step(monitor_value)
-            
-            # Update history
-            history['train_loss'].append(train_loss)
-            history['val_metrics'].append(val_metrics)
-            history['learning_rate'].append(self.optimizer.param_groups[0]['lr'])
-            
-            # Save checkpoint if needed
-            if (epoch + 1) % save_every == 0:
-                self.save_checkpoint(f"{save_dir}/checkpoint_epoch_{epoch+1}.pth")
-            
-            # Check for best model
-            if monitor_metric == 'loss':
-                current_metric = train_loss
-            else:
-                current_metric = val_metrics.get(monitor_metric, float('inf'))
+                # Train for one epoch
+                train_loss = self.train_epoch(train_dataloader)
                 
-            is_best = False
-            if minimize_metric and current_metric < self.best_val_metric:
-                is_best = True
-                self.best_val_metric = current_metric
-                self.early_stop_count = 0
-            elif not minimize_metric and current_metric > self.best_val_metric:
-                is_best = True
-                self.best_val_metric = current_metric
-                self.early_stop_count = 0
-            else:
-                self.early_stop_count += 1
+                # Update learning rate if using step scheduler
+                if self.scheduler and not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    self.scheduler.step()
+                    
+                # Validate
+                val_metrics = self.evaluate(val_dataloader)
                 
-            if is_best:
-                self.save_checkpoint(f"{save_dir}/best_model.pth")
+                # Update learning rate if using plateau scheduler
+                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    monitor_value = val_metrics.get(monitor_metric, train_loss)
+                    self.scheduler.step(monitor_value)
                 
-            # Print progress
-            elapsed = time.time() - start_time
-            print(f"Epoch {epoch+1}/{epochs} - Time: {elapsed:.2f}s - Loss: {train_loss:.6f}")
-            for metric, value in val_metrics.items():
-                print(f"  {metric}: {value:.6f}")
+                # Calculate epoch time
+                epoch_time = time.time() - epoch_start_time
                 
-            # Early stopping
-            if early_stopping and self.early_stop_count >= early_stopping:
-                print(f"Early stopping triggered after {epoch+1} epochs")
-                break
+                # Update history
+                history['train_loss'].append(train_loss)
+                history['val_metrics'].append(val_metrics)
+                history['learning_rate'].append(self.optimizer.param_groups[0]['lr'])
                 
-            # Update progress if callback provided
-            if progress_callback and callable(progress_callback):
-                progress_callback(epoch + 1, epochs, {
-                    'train_loss': train_loss,
-                    'val_metrics': val_metrics,
-                    'best_metric': self.best_val_metric
-                })
+                # Save checkpoint if needed
+                checkpoint_path = None
+                if save_every > 0 and (epoch + 1) % save_every == 0:
+                    checkpoint_path = f"{save_dir}/checkpoint_epoch_{epoch+1}.pth"
+                    self.save_checkpoint(checkpoint_path)
+                
+                # Check for best model
+                if monitor_metric == 'loss':
+                    current_metric = train_loss
+                else:
+                    current_metric = val_metrics.get(monitor_metric, float('inf'))
+                    
+                is_best = False
+                if minimize_metric and current_metric < self.best_val_metric:
+                    is_best = True
+                    self.best_val_metric = current_metric
+                    self.early_stop_count = 0
+                elif not minimize_metric and current_metric > self.best_val_metric:
+                    is_best = True
+                    self.best_val_metric = current_metric
+                    self.early_stop_count = 0
+                else:
+                    self.early_stop_count += 1
+                    
+                best_model_path = None
+                if is_best:
+                    best_model_path = f"{save_dir}/best_model.pth"
+                    self.save_checkpoint(best_model_path)
+                    
+                # Log metrics to MLflow if enabled
+                if mlflow_enabled and self.tracker and epoch % mlflow_log_freq == 0:
+                    # Track metrics
+                    train_metrics = {'loss': train_loss}
+                    
+                    # Additional metrics
+                    train_metrics.update({
+                        'learning_rate': self.optimizer.param_groups[0]['lr'],
+                        'epoch_time': epoch_time
+                    })
+                    
+                    # Log metrics
+                    track_training_epoch(self, epoch, train_metrics=train_metrics, val_metrics=val_metrics)
+                    
+                    # Log model checkpoint as artifact if enabled
+                    if mlflow_log_model and checkpoint_path and os.path.exists(checkpoint_path):
+                        self.tracker.log_artifact(checkpoint_path)
+                    
+                    # Log best model if it's a new best
+                    if is_best and best_model_path and os.path.exists(best_model_path):
+                        self.tracker.log_artifact(best_model_path)
+                    
+                # Print progress
+                elapsed = time.time() - start_time
+                print(f"Epoch {epoch+1}/{epochs} - Time: {elapsed:.2f}s - Loss: {train_loss:.6f}")
+                for metric, value in val_metrics.items():
+                    print(f"  {metric}: {value:.6f}")
+                    
+                # Early stopping
+                if early_stopping and self.early_stop_count >= early_stopping:
+                    print(f"Early stopping triggered after {epoch+1} epochs")
+                    
+                    # Log early stopping to MLflow
+                    if mlflow_enabled and self.tracker:
+                        self.tracker.log_param("early_stopping_epoch", epoch+1)
+                    
+                    break
+                    
+                # Update progress if callback provided
+                if progress_callback and callable(progress_callback):
+                    progress_callback(epoch + 1, epochs, {
+                        'train_loss': train_loss,
+                        'val_metrics': val_metrics,
+                        'best_metric': self.best_val_metric
+                    })
+        
+        except Exception as e:
+            print(f"Error during training: {e}")
+            # Log error to MLflow
+            if mlflow_enabled and self.tracker:
+                self.tracker.log_param("training_error", str(e))
+            raise
+        
+        finally:
+            # End MLflow run if enabled
+            if mlflow_enabled and self.tracker and hasattr(self.tracker, 'end_run'):
+                # Log final metrics before ending run
+                if len(history['train_loss']) > 0:
+                    final_metrics = {
+                        'final_train_loss': history['train_loss'][-1],
+                        'best_val_metric': self.best_val_metric,
+                        'total_epochs': len(history['train_loss']),
+                        'total_training_time': time.time() - start_time
+                    }
+                    
+                    # Add final validation metrics
+                    if len(history['val_metrics']) > 0:
+                        for metric, value in history['val_metrics'][-1].items():
+                            final_metrics[f'final_val_{metric}'] = value
+                    
+                    # Log metrics
+                    self.tracker.log_metrics(final_metrics)
+                
+                self.tracker.end_run()
         
         return history
     
@@ -399,3 +503,81 @@ class Training(Validation):
         
         print(f"Checkpoint loaded from {path}")
         return True 
+
+    def save_training_visualization(self, history, filename="training_history.png"):
+        """
+        Save training history visualization to the storage directory.
+        
+        Args:
+            history: Training history dictionary containing metrics
+            filename: Name of the output file
+        
+        Returns:
+            Path to the saved visualization file
+        """
+        import matplotlib.pyplot as plt
+        
+        # Get storage path from config
+        storage_root = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            "storage"
+        )
+        
+        # Use project name and version from config for subfolder structure
+        project_name = self.config.get("project_name", "default_project")
+        version = self.config.get("version", "v1.0")
+        if "experiment_tracking" in self.config:
+            project_name = self.config["experiment_tracking"].get("project_name", project_name)
+            version = self.config["experiment_tracking"].get("version", version)
+        
+        # Create directory structure
+        save_dir = os.path.join(storage_root, project_name, version, "visualizations")
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Full path for the output file
+        output_path = os.path.join(save_dir, filename)
+        
+        # Create the visualization
+        plt.figure(figsize=(12, 4))
+        
+        # Plot training loss
+        plt.subplot(1, 2, 1)
+        plt.plot(history.get('train_loss', []), label='Train Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training Loss')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        
+        # Plot validation metrics
+        plt.subplot(1, 2, 2)
+        metrics = self.config.get('metrics', ['loss'])
+        for metric in metrics:
+            values = []
+            for epoch_metrics in history.get('val_metrics', []):
+                values.append(epoch_metrics.get(metric, float('nan')))
+            plt.plot(values, label=f'Val {metric}')
+        
+        plt.xlabel('Epoch')
+        plt.ylabel('Metric Value')
+        plt.title('Validation Metrics')
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        
+        # Add a suptitle with project and version
+        plt.suptitle(f"Training Results - {project_name} ({version})")
+        plt.tight_layout()
+        
+        # Save the figure
+        plt.savefig(output_path, dpi=300)
+        plt.close()
+        
+        print(f"Training visualization saved to {output_path}")
+        
+        # Log the visualization to MLflow if enabled
+        if hasattr(self, 'tracker') and self.tracker and self.config.get("experiment_tracking", {}).get("enable", False):
+            self.tracker.log_artifact(output_path)
+            print(f"Training visualization logged to MLflow")
+        
+        return output_path 
+    

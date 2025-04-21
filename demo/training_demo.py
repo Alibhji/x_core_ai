@@ -1,6 +1,7 @@
 import sys
 import torch
-import matplotlib.pyplot as plt
+import argparse
+import os
 
 # Add parent directory to path to import our modules
 paths = [r'C:\Users\alibh\Desktop\projects\python', r'C:\Users\alibh\Desktop\projects\python\x_core_ai']
@@ -12,76 +13,7 @@ for path in paths:
 from src.core import Core, Forecast, Validation, Training
 from sub_module.utilx.src.config import ConfigLoader
 
-def create_dummy_config():
-    """Create a dummy configuration for testing"""
-    # Use same sequence length (40) for both model and dataset
-    sequence_length = 40
-    feature_dim = 768
-    
-    config = {
-        "project_name": "training_demo",
-        "distributed": False,
-        "gpus": [0],
-        
-        # Data configuration
-        "data_name": "dummy_dataframe",
-        "dataframe_kwargs": {
-            "photo_feature_sequence_length": sequence_length,  # Use the shared variable
-            "photo_feature_dim": feature_dim,  # Use the shared variable
-            "target_name": "cost_target",
-            "target_type": "regression",
-            "target_range": [0, 100],
-            "number_of_samples": 1000
-        },
-        
-        # Dataset configuration
-        "dataset_name": "photo_feature_dataset",
-        "dataset_kwargs": {
-            "photo_feature_sequence_length": sequence_length,  # Add this to be explicit
-            "photo_feature_dim": feature_dim,  # Add this to be explicit
-            "target_name": "cost_target"
-        },
-        
-        # Model configuration
-        "model_name": "gated_cross_attention",
-        "model_kwargs": {
-            "input_shape": [sequence_length, feature_dim],  # Use the shared variable
-            "num_layers": 2,
-            "num_heads": 4,
-            "hidden_dim": 512,
-            "dropout": 0.1,
-            "target_name": "cost_target"
-        },
-        
-        # Training configuration
-        "epochs": 5,
-        "learning_rate": 0.001,
-        "weight_decay": 0.01,
-        "loss": "mse",
-        "optimizer": "adam",
-        "scheduler": "cosine",
-        "metrics": ["mse", "mae", "rmse"],
-        "monitor_metric": "mse",
-        "save_dir": "checkpoints",
-        "save_every": 1,
-        "early_stopping_kwargs": {
-            "patience": 3
-        },
-        
-        # Dataloader configuration
-        "dataloader_kwargs_train": {
-            "batch_size": 16,
-            "shuffle": True,
-            "num_workers": 0
-        },
-        "dataloader_kwargs_val": {
-            "batch_size": 32,
-            "shuffle": False,
-            "num_workers": 0
-        }
-    }
-    
-    return config
+
 
 def demo_core(config):
     """Demonstrate Core functionality"""
@@ -138,7 +70,7 @@ def demo_validation(config):
 def demo_training(config):
     """Demonstrate Training functionality"""
     print("\n===== Training Demo =====")
-    # Initialize Training class
+    # Initialize Training class (MLflow integration is built-in now)
     training = Training(config)
     
     # Display training setup
@@ -146,6 +78,10 @@ def demo_training(config):
     print(f"Loss function: {training.loss_fn.__class__.__name__}")
     if training.scheduler:
         print(f"Scheduler: {training.scheduler.__class__.__name__}")
+    
+    # Check if MLflow is enabled
+    if hasattr(training, 'tracker') and training.tracker:
+        print("MLflow experiment tracking is enabled")
     
     # Get dataloaders
     train_dataloader = training.get_train_dataloader()
@@ -156,38 +92,87 @@ def demo_training(config):
     print("Starting training...")
     history = training.train(train_dataloader, val_dataloader)
     
-    # Plot training history
-    plt.figure(figsize=(12, 4))
-    
-    plt.subplot(1, 2, 1)
-    plt.plot(history['train_loss'], label='Train Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training Loss')
-    plt.legend()
-    
-    plt.subplot(1, 2, 2)
-    for metric in config['metrics']:
-        plt.plot([epoch_metrics.get(metric, float('nan')) for epoch_metrics in history['val_metrics']], 
-                 label=f'Val {metric}')
-    plt.xlabel('Epoch')
-    plt.ylabel('Metric Value')
-    plt.title('Validation Metrics')
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig('training_history.png')
-    print("Training history saved to training_history.png")
+    # Save training visualization using the new method
+    vis_path = training.save_training_visualization(history)
+    print(f"Training visualization saved to: {vis_path}")
     
     return training
+
+
+def parse_args():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='X-Core AI Training Demo')
+    parser.add_argument('--config', type=str, default="configs/demo/dummy_train.yaml", 
+                       help='Path to configuration file')
+    parser.add_argument('--mlflow', action='store_true', help='Enable MLflow experiment tracking')
+    parser.add_argument('--open-ui', action='store_true', help='Open MLflow UI after training')
+    return parser.parse_args()
+
+def open_mlflow_ui():
+    """Open MLflow UI"""
+    try:
+        import subprocess
+        import webbrowser
+        import time
+        import mlflow
+        
+        # Get tracking URI
+        tracking_uri = mlflow.get_tracking_uri()
+        print(f"\nOpening MLflow UI at {tracking_uri}")
+        
+        # Start MLflow UI server
+        mlflow_cmd = [sys.executable, "-m", "mlflow", "ui", "--backend-store-uri", tracking_uri]
+        print(f"Running command: {' '.join(mlflow_cmd)}")
+        
+        # Start server as subprocess
+        server_process = subprocess.Popen(
+            mlflow_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Wait for server to start
+        time.sleep(2)
+        
+        # Check if process is running
+        if server_process.poll() is None:
+            # Open browser
+            webbrowser.open("http://localhost:5000")
+            
+            print("\nMLflow UI is now running. Press Ctrl+C to stop.")
+            print("You can access it at http://localhost:5000")
+            
+            # Keep running until interrupted
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print("\nStopping MLflow UI...")
+                server_process.terminate()
+        else:
+            # If process exited, print error
+            stdout, stderr = server_process.communicate()
+            print(f"MLflow UI failed to start: {stderr}")
+    except Exception as e:
+        print(f"Error launching MLflow UI: {e}")
+        print(f"You can manually start the UI with: mlflow ui --backend-store-uri {mlflow.get_tracking_uri()}")
 
 def main():
     """Main demo function"""
     print("=== X-Core AI Framework Demo ===")
     
+    # Parse command line arguments
+    args = parse_args()
+    
     # Create dummy config
-    config = create_dummy_config()
+    config = ConfigLoader.load_config(args.config)
     print("Created dummy configuration")
+    
+    # Update config based on command line args
+    if args.mlflow and "experiment_tracking" in config:
+        if args.open_ui:
+            config["experiment_tracking"]["open_ui"] = True
     
     # Demo each class
     core = demo_core(config)
@@ -196,6 +181,12 @@ def main():
     training = demo_training(config)
     
     print("\n=== Demo Completed Successfully ===")
+    
+    # Open MLflow UI if configured
+    if (args.mlflow and args.open_ui and 
+        "experiment_tracking" in config and 
+        config["experiment_tracking"].get("open_ui", False)):
+        open_mlflow_ui()
 
 if __name__ == "__main__":
     main() 
