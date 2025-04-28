@@ -38,8 +38,8 @@ def demo_forecast(config):
     
     # Create dummy input
     dummy_input = torch.randn(1, 
-                             config['dataframe_kwargs']['photo_feature_sequence_length'],
-                             config['dataframe_kwargs']['photo_feature_dim'])
+                             config['data_kwargs']['photo_feature_sequence_length'],
+                             config['data_kwargs']['photo_feature_dim'])
     
     # Make prediction
     print("Making single prediction...")

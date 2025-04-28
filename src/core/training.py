@@ -1,583 +1,354 @@
+from .core_base import Core
+import torch
+from .metrics import Metrics
+from .validation import Validation
 import os
 import time
-import torch
-import numpy as np
-from .validation import Validation
+from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
 
-# Import MLflow integration from experiment_tracker
-try:
-    from ..experiment_tracker import integrate_tracker_with_core, track_training_epoch
-    _has_mlflow = True
-except ImportError:
-    _has_mlflow = False
+class Training(Core):
+    """Training class for model training"""
 
-class Training(Validation):
-    def __init__(self, config, package_name='x_core_ai.src'):
-        """Training class for model training"""
+    def __init__(self, config, 
+                 package_name='x_core_ai.src',
+                 df_train=None,
+                 df_val=None,
+                 train_dataloader=None,
+                 val_dataloader=None):
         super().__init__(config, package_name)
-        self.setup_training()
         
-        # Setup MLflow tracking if enabled in config
-        self.tracker = None
-        if _has_mlflow and self.config.get("experiment_tracking", {}).get("enable", False):
-            self.tracker = integrate_tracker_with_core(self)
+        # Setup training dataset/dataloader
+        if df_train is None and train_dataloader is None:
+            df = self._get_dataframe(self.config['data_name'], **self.config['data_kwargs'])
+            train_dataset = self.create_dataset(df.df_train, train=True)
+            self.train_dataloader = self.create_dataloader(train_dataset, train=True)
+        elif df_train is not None:
+            train_dataset = self.create_dataset(df_train, train=True)
+            self.train_dataloader = self.create_dataloader(train_dataset, train=True)
+        elif train_dataloader is not None:
+            self.train_dataloader = train_dataloader
         
-    def setup_training(self):
-        """Setup training components"""
-        # Set model to training mode
+        # Setup validation class for evaluation
+        self.validation = Validation(
+            config=config,
+            package_name=package_name,
+            df_val=df_val,
+            val_dataloader=val_dataloader
+        )
+        
+        print(f"Training dataloader: {len(self.train_dataloader)} batches")
+        print(f"Validation dataloader: {len(self.validation.val_dataloader)} batches")
+        
+        # Setup model, optimizer, loss, and scheduler
+        self.setup_model()
+        self.setup_optimizer()
+        self.setup_loss_functions()
+        self.setup_scheduler()
+        
+        # Track best model and metrics
+        self.best_val_loss = float('inf')
+        self.best_epoch = 0
+        self.early_stop_counter = 0
+        self.early_stop_patience = self.config.get('trainer_kwargs', {}).get('early_stopping_kwargs', {}).get('patience', 20)
+        self.early_stop_min_delta = self.config.get('trainer_kwargs', {}).get('early_stopping_kwargs', {}).get('min_delta', 0.001)
+        
+        # Get save directory for checkpoints
+        save_path = self.config.get('model_checkpoint_path', 'checkpoints')
+        project_name = self.config.get('project_name', 'model')
+        
+        # Fix path if it contains raw string literal prefix
+        if isinstance(save_path, str):
+            if save_path.startswith('r"') or save_path.startswith("r'"):
+                save_path = save_path[2:-1]  # Remove r" and closing quote
+        
+        self.save_dir = os.path.join(save_path, project_name)
+        os.makedirs(self.save_dir, exist_ok=True)
+
+    def setup_model(self):
+        """Setup model for training"""
+        self.model_generator()
+        self.model_to_device()
         self.model.train()
+        print("Model setup complete")
+
+    def setup_optimizer(self):
+        """Setup optimizer based on config"""
+        optimizer_name = self.config.get('trainer_kwargs', {}).get('optimizer', 'adam').lower()
+        optimizer_kwargs = self.config.get('trainer_kwargs', {}).get('optimizer_kwargs', {})
         
-        # Setup optimizer
-        self.optimizer = self.get_optimizer()
-        
-        # Setup scheduler
-        self.scheduler = self.get_scheduler()
-        
-        # Setup loss function
-        self.loss_fn = self.get_loss_function()
-        
-        # Setup training state
-        self.current_epoch = 0
-        self.best_val_metric = float('inf')  # Lower is better by default
-        self.early_stop_count = 0
-        self.train_losses = []
-        self.val_metrics = {}
-        
-    def get_optimizer(self):
-        """Get optimizer from config"""
-        optimizer_name = self.config.get('optimizer', 'adam')
-        lr = self.config.get('learning_rate', 0.001)
-        weight_decay = self.config.get('weight_decay', 0.0)
-        
-        optimizer_kwargs = self.config.get('optimizer_kwargs', {})
-        if 'lr' not in optimizer_kwargs:
-            optimizer_kwargs['lr'] = lr
-        if 'weight_decay' not in optimizer_kwargs:
-            optimizer_kwargs['weight_decay'] = weight_decay
-            
-        if optimizer_name.lower() == 'adam':
-            return torch.optim.Adam(self.model.parameters(), **optimizer_kwargs)
-        elif optimizer_name.lower() == 'adamw':
-            return torch.optim.AdamW(self.model.parameters(), **optimizer_kwargs)
-        elif optimizer_name.lower() == 'sgd':
-            return torch.optim.SGD(self.model.parameters(), **optimizer_kwargs)
+        if optimizer_name == 'adam':
+            self.optimizer = torch.optim.Adam(
+                self.model.parameters(),
+                lr=optimizer_kwargs.get('lr', 0.001),
+                weight_decay=optimizer_kwargs.get('weight_decay', 0.01),
+                betas=optimizer_kwargs.get('betas', (0.9, 0.999)),
+                eps=optimizer_kwargs.get('eps', 1e-8)
+            )
+        elif optimizer_name == 'adamw':
+            self.optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=optimizer_kwargs.get('lr', 0.001),
+                weight_decay=optimizer_kwargs.get('weight_decay', 0.01),
+                betas=optimizer_kwargs.get('betas', (0.9, 0.999)),
+                eps=optimizer_kwargs.get('eps', 1e-8)
+            )
+        elif optimizer_name == 'sgd':
+            self.optimizer = torch.optim.SGD(
+                self.model.parameters(),
+                lr=optimizer_kwargs.get('lr', 0.01),
+                momentum=optimizer_kwargs.get('momentum', 0.9),
+                weight_decay=optimizer_kwargs.get('weight_decay', 0.0001)
+            )
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer_name}")
-            
-    def get_scheduler(self):
-        """Get learning rate scheduler from config"""
-        if not self.config.get('scheduler_kwargs'):
-            return None
-            
-        scheduler_type = self.config.get('scheduler', 'cosine')
-        scheduler_kwargs = self.config.get('scheduler_kwargs', {})
         
-        if scheduler_type.lower() == 'cosine':
-            return torch.optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, 
-                T_max=self.config.get('epochs', 100),
-                **{k: v for k, v in scheduler_kwargs.items() if k != 'T_max'}
-            )
-        elif scheduler_type.lower() == 'step':
-            return torch.optim.lr_scheduler.StepLR(
+        print(f"Optimizer setup: {optimizer_name}")
+
+    def setup_loss_functions(self):
+        """Setup loss functions based on config"""
+        self.loss_kwargs = self.config.get('loss_kwargs', {})
+        self.loss_fns = {}
+        
+        for task, task_config in self.loss_kwargs.items():
+            loss_fn_name = task_config.get('loss_fn', 'CrossEntropyLoss')
+            
+            if loss_fn_name == 'CrossEntropyLoss':
+                ignore_index = task_config.get('ignore_index', -100)
+                self.loss_fns[task] = torch.nn.CrossEntropyLoss(ignore_index=ignore_index)
+            elif loss_fn_name == 'BCEWithLogitsLoss':
+                self.loss_fns[task] = torch.nn.BCEWithLogitsLoss()
+            elif loss_fn_name == 'MSELoss':
+                self.loss_fns[task] = torch.nn.MSELoss()
+            else:
+                raise ValueError(f"Unsupported loss function: {loss_fn_name}")
+        
+        print(f"Loss functions setup: {', '.join(self.loss_fns.keys())}")
+
+    def setup_scheduler(self):
+        """Setup learning rate scheduler based on config"""
+        scheduler_name = self.config.get('trainer_kwargs', {}).get('scheduler', None)
+        if not scheduler_name:
+            self.scheduler = None
+            return
+        
+        scheduler_kwargs = self.config.get('trainer_kwargs', {}).get('scheduler_kwargs', {})
+        
+        if scheduler_name.lower() == 'cosine':
+            total_epochs = self.config.get('trainer_kwargs', {}).get('epochs', 100)
+            self.scheduler = CosineAnnealingLR(
                 self.optimizer,
-                **scheduler_kwargs
+                T_max=total_epochs,
+                eta_min=scheduler_kwargs.get('eta_min', 0)
             )
-        elif scheduler_type.lower() == 'plateau':
-            return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        elif scheduler_name.lower() == 'plateau':
+            self.scheduler = ReduceLROnPlateau(
                 self.optimizer,
-                **scheduler_kwargs
+                mode=scheduler_kwargs.get('mode', 'min'),
+                factor=scheduler_kwargs.get('factor', 0.1),
+                patience=scheduler_kwargs.get('patience', 10),
+                verbose=scheduler_kwargs.get('verbose', True)
             )
         else:
-            return None
-            
-    def get_loss_function(self):
-        """Get loss function from config"""
-        loss_name = self.config.get('loss', 'mse')
+            raise ValueError(f"Unsupported scheduler: {scheduler_name}")
         
-        if loss_name.lower() == 'mse':
-            return torch.nn.MSELoss()
-        elif loss_name.lower() == 'mae':
-            return torch.nn.L1Loss()
-        elif loss_name.lower() == 'bce':
-            return torch.nn.BCELoss()
-        elif loss_name.lower() == 'ce':
-            return torch.nn.CrossEntropyLoss()
-        else:
-            raise ValueError(f"Unsupported loss function: {loss_name}")
-            
-    def train_epoch(self, train_dataloader):
-        """
-        Train for one epoch
-        Args:
-            train_dataloader: DataLoader with training data
-        Returns:
-            Average loss for the epoch
-        """
+        print(f"Scheduler setup: {scheduler_name}")
+
+    def get_inputs_targets(self, batch, drop_keys=[]):
+        """Get inputs and targets from batch"""
+        inputs = batch['inputs']
+        targets = batch['targets']  
+        # to device
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        targets = {k: v.to(self.device) for k, v in targets.items()}
+        if drop_keys:
+            for key in drop_keys:
+                if key in inputs:
+                    inputs.pop(key)
+        return inputs, targets
+
+    def train_one_epoch(self, epoch):
+        """Train for one epoch"""
         self.model.train()
-        epoch_loss = 0.0
-        batch_count = 0
-        
-        # Check if using GCAN
-        is_gcan = self.config.get('model_name') == 'gated_cross_attention'
-        target_name = self.config.get('target_name', 'cost_target')
-        
-        for batch in train_dataloader:
-            # Extract inputs and targets
-            if isinstance(batch, dict):
-                if target_name in batch:
-                    targets = batch[target_name].to(self.device)
-                    
-                    # For GCAN, use photo_feat
-                    if is_gcan and 'photo_feat' in batch:
-                        inputs = batch['photo_feat'].to(self.device)
-                    else:
-                        inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                                for k, v in batch.items() if k != target_name}
-                else:
-                    # Try common fallbacks
-                    targets = batch.get('target')
-                    if targets is not None:
-                        targets = targets.to(self.device)
-                    
-                    if 'photo_feat' in batch:
-                        inputs = batch['photo_feat'].to(self.device)
-                    else:
-                        # Use first non-target key as input
-                        for k, v in batch.items():
-                            if k != 'target' and isinstance(v, torch.Tensor):
-                                inputs = v.to(self.device)
-                                break
-            else:
-                # Handle tuple of (inputs, targets)
-                inputs, targets = batch
-                inputs = inputs.to(self.device)
-                targets = targets.to(self.device)
-            
-            # Zero gradients
-            self.optimizer.zero_grad()
-            
-            # Forward pass
-            if is_gcan and isinstance(inputs, torch.Tensor):
-                outputs = self.model(photo_feat=inputs)
-            else:
-                outputs = self.model(inputs)
-            
-            # Calculate loss
-            if isinstance(outputs, dict):
-                if target_name in outputs:
-                    outputs = outputs[target_name]
-                else:
-                    outputs = next(iter(outputs.values()))
-            
-            # Ensure targets have the same dtype as outputs to avoid dtype mismatch
-            if isinstance(targets, torch.Tensor) and isinstance(outputs, torch.Tensor):
-                if outputs.dtype != targets.dtype:
-                    # For most loss functions, float is expected
-                    if self.config.get('loss', 'mse').lower() in ['mse', 'mae', 'bce']:
-                        # If using regression losses, convert both to float
-                        outputs = outputs.float()
-                        targets = targets.float()
-                    elif self.config.get('loss', 'mse').lower() in ['ce']:
-                        # For CrossEntropyLoss, targets should be Long
-                        if outputs.dtype == torch.float32:
-                            targets = targets.long()
-                    else:
-                        # Default case: convert targets to match outputs
-                        targets = targets.to(dtype=outputs.dtype)
-                
-                # Ensure target has the same shape as outputs for loss calculation
-                # This fixes the shape mismatch warning
-                if outputs.dim() > targets.dim():
-                    if outputs.shape[0] == targets.shape[0]:
-                        # If batch dimension matches but target is 1D, reshape to match output dimensions
-                        targets = targets.reshape(targets.shape[0], *([1] * (outputs.dim() - 1)))
-                        # Now expand to match exact output shape
-                        targets = targets.expand_as(outputs)
-                elif outputs.dim() < targets.dim():
-                    # If output has fewer dimensions, squeeze extra dimensions from targets
-                    targets = targets.squeeze()
-                    # If we still have mismatch, try to reshape targets to match output shape
-                    if outputs.shape != targets.shape:
-                        try:
-                            targets = targets.view(outputs.shape)
-                        except:
-                            print(f"Warning: Unable to reshape targets {targets.shape} to match outputs {outputs.shape}")
-                
-            loss = self.loss_fn(outputs, targets)
-            
-            # Backward pass and optimize
-            loss.backward()
-            self.optimizer.step()
-            
-            # Update loss
-            epoch_loss += loss.item()
-            batch_count += 1
-        
-        # Calculate average loss
-        avg_loss = epoch_loss / batch_count if batch_count > 0 else 0
-        return avg_loss
-        
-    def train(self, train_dataloader=None, val_dataloader=None, progress_callback=None):
-        """
-        Train the model
-        Args:
-            train_dataloader: DataLoader with training data (uses default if None)
-            val_dataloader: DataLoader with validation data (uses default if None)
-            progress_callback: Optional callback for progress updates
-        Returns:
-            Training history
-        """
-        # Get dataloaders if not provided
-        if train_dataloader is None:
-            train_dataloader = self.get_train_dataloader()
-        if val_dataloader is None:
-            val_dataloader = self.get_val_dataloader()
-            
-        if train_dataloader is None:
-            raise ValueError("No training dataloader available")
-        if val_dataloader is None:
-            raise ValueError("No validation dataloader available")
-        
-        # Training parameters
-        epochs = self.config.get('epochs', 100)
-        early_stopping = self.config.get('early_stopping_kwargs', {}).get('patience', None)
-        save_dir = self.config.get('save_dir', 'checkpoints')
-        save_every = self.config.get('save_every', 10)
-        monitor_metric = self.config.get('monitor_metric', 'loss')
-        
-        # Create save directory
-        os.makedirs(save_dir, exist_ok=True)
-        
-        # Training loop
-        history = {
-            'train_loss': [],
-            'val_metrics': [],
-            'learning_rate': []
-        }
-        
-        # Get metric direction (minimize or maximize)
-        minimize_metric = True
-        if monitor_metric in ['accuracy', 'r2', 'f1', 'precision', 'recall']:
-            minimize_metric = False
-            self.best_val_metric = -float('inf')  # For metrics where higher is better
-        
-        # MLflow configuration
-        mlflow_config = self.config.get('experiment_tracking', {})
-        mlflow_enabled = mlflow_config.get('enable', False) and _has_mlflow
-        mlflow_log_freq = mlflow_config.get('log_freq', 1)
-        mlflow_log_model = mlflow_config.get('log_model', True)
-        
-        # Start MLflow run if enabled
-        if mlflow_enabled and self.tracker:
-            run_name = mlflow_config.get('run_name', self.config.get('project_name', 'training'))
-            self.tracker.start_run(run_name=run_name)
-            
-            # Log model parameters
-            model_params = self.config.get('model_kwargs', {})
-            train_params = {
-                'epochs': epochs,
-                'learning_rate': self.config.get('learning_rate', 0.001),
-                'weight_decay': self.config.get('weight_decay', 0),
-                'optimizer': self.config.get('optimizer', 'adam'),
-                'scheduler': self.config.get('scheduler', ''),
-                'loss': self.config.get('loss', 'mse'),
-                'batch_size': self.config.get('dataloader_kwargs_train', {}).get('batch_size', 32)
-            }
-            
-            if hasattr(self.tracker, 'log_params'):
-                self.tracker.log_params(model_params)
-                self.tracker.log_params(train_params)
+        epoch_loss = 0
+        num_batches = len(self.train_dataloader)
         
         start_time = time.time()
-        
-        try:
-            for epoch in range(self.current_epoch, epochs):
-                self.current_epoch = epoch
-                epoch_start_time = time.time()
-                
-                # Train for one epoch
-                train_loss = self.train_epoch(train_dataloader)
-                
-                # Update learning rate if using step scheduler
-                if self.scheduler and not isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    self.scheduler.step()
-                    
-                # Validate
-                val_metrics = self.evaluate(val_dataloader)
-                
-                # Update learning rate if using plateau scheduler
-                if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    monitor_value = val_metrics.get(monitor_metric, train_loss)
-                    self.scheduler.step(monitor_value)
-                
-                # Calculate epoch time
-                epoch_time = time.time() - epoch_start_time
-                
-                # Update history
-                history['train_loss'].append(train_loss)
-                history['val_metrics'].append(val_metrics)
-                history['learning_rate'].append(self.optimizer.param_groups[0]['lr'])
-                
-                # Save checkpoint if needed
-                checkpoint_path = None
-                if save_every > 0 and (epoch + 1) % save_every == 0:
-                    checkpoint_path = f"{save_dir}/checkpoint_epoch_{epoch+1}.pth"
-                    self.save_checkpoint(checkpoint_path)
-                
-                # Check for best model
-                if monitor_metric == 'loss':
-                    current_metric = train_loss
-                else:
-                    current_metric = val_metrics.get(monitor_metric, float('inf'))
-                    
-                is_best = False
-                if minimize_metric and current_metric < self.best_val_metric:
-                    is_best = True
-                    self.best_val_metric = current_metric
-                    self.early_stop_count = 0
-                elif not minimize_metric and current_metric > self.best_val_metric:
-                    is_best = True
-                    self.best_val_metric = current_metric
-                    self.early_stop_count = 0
-                else:
-                    self.early_stop_count += 1
-                    
-                best_model_path = None
-                if is_best:
-                    best_model_path = f"{save_dir}/best_model.pth"
-                    self.save_checkpoint(best_model_path)
-                    
-                # Log metrics to MLflow if enabled
-                if mlflow_enabled and self.tracker and epoch % mlflow_log_freq == 0:
-                    # Track metrics
-                    train_metrics = {'loss': train_loss}
-                    
-                    # Additional metrics
-                    train_metrics.update({
-                        'learning_rate': self.optimizer.param_groups[0]['lr'],
-                        'epoch_time': epoch_time
-                    })
-                    
-                    # Log metrics
-                    track_training_epoch(self, epoch, train_metrics=train_metrics, val_metrics=val_metrics)
-                    
-                    # Log model checkpoint as artifact if enabled
-                    if mlflow_log_model and checkpoint_path and os.path.exists(checkpoint_path):
-                        self.tracker.log_artifact(checkpoint_path)
-                    
-                    # Log best model if it's a new best
-                    if is_best and best_model_path and os.path.exists(best_model_path):
-                        self.tracker.log_artifact(best_model_path)
-                    
-                # Print progress
-                elapsed = time.time() - start_time
-                print(f"Epoch {epoch+1}/{epochs} - Time: {elapsed:.2f}s - Loss: {train_loss:.6f}")
-                for metric, value in val_metrics.items():
-                    print(f"  {metric}: {value:.6f}")
-                    
-                # Early stopping
-                if early_stopping and self.early_stop_count >= early_stopping:
-                    print(f"Early stopping triggered after {epoch+1} epochs")
-                    
-                    # Log early stopping to MLflow
-                    if mlflow_enabled and self.tracker:
-                        self.tracker.log_param("early_stopping_epoch", epoch+1)
-                    
-                    break
-                    
-                # Update progress if callback provided
-                if progress_callback and callable(progress_callback):
-                    progress_callback(epoch + 1, epochs, {
-                        'train_loss': train_loss,
-                        'val_metrics': val_metrics,
-                        'best_metric': self.best_val_metric
-                    })
-        
-        except Exception as e:
-            print(f"Error during training: {e}")
-            # Log error to MLflow
-            if mlflow_enabled and self.tracker:
-                self.tracker.log_param("training_error", str(e))
-            raise
-        
-        finally:
-            # End MLflow run if enabled
-            if mlflow_enabled and self.tracker and hasattr(self.tracker, 'end_run'):
-                # Log final metrics before ending run
-                if len(history['train_loss']) > 0:
-                    final_metrics = {
-                        'final_train_loss': history['train_loss'][-1],
-                        'best_val_metric': self.best_val_metric,
-                        'total_epochs': len(history['train_loss']),
-                        'total_training_time': time.time() - start_time
-                    }
-                    
-                    # Add final validation metrics
-                    if len(history['val_metrics']) > 0:
-                        for metric, value in history['val_metrics'][-1].items():
-                            final_metrics[f'final_val_{metric}'] = value
-                    
-                    # Log metrics
-                    self.tracker.log_metrics(final_metrics)
-                
-                self.tracker.end_run()
-        
-        return history
-    
-    def get_train_dataloader(self):
-        """Get training dataloader"""
-        # Load training dataset from config
-        if self.config.get('dataset_name') and self.config.get('dataset_kwargs'):
-            df_train = None
-            if self.config.get('data_name'):
-                dataframe = self.get_dataframe(self.config['data_name'], 
-                                              **self.config.get('dataframe_kwargs', {}))
-                df_train = dataframe.df_train
-                
-            dataset = self.get_dataset(self.config['dataset_name'], 
-                                      df=df_train, 
-                                      train=True, 
-                                      **self.config.get('dataset_kwargs', {}))
-        else:
-            raise ValueError("No training dataset configured")
+        for batch_idx, batch in enumerate(self.train_dataloader):
+            # Forward pass
+            inputs, targets = self.get_inputs_targets(batch)
+            self.optimizer.zero_grad()
             
-        # Create dataloader
-        batch_size = self.config.get('dataloader_kwargs_train', {}).get('batch_size', 32)
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=batch_size,
-            **{k: v for k, v in self.config.get('dataloader_kwargs_train', {}).items() if k != 'batch_size'}
-        )
+            outputs = self.model(**inputs)
+            
+            # Calculate loss for each task
+            batch_loss = 0
+            for task, loss_fn in self.loss_fns.items():
+                if task in outputs and task in targets:
+                    # For CrossEntropyLoss, reshape if needed
+                    if isinstance(loss_fn, torch.nn.CrossEntropyLoss):
+                        logits = outputs[task]
+                        if len(logits.shape) == 3:  # [batch_size, seq_len, vocab_size]
+                            task_loss = loss_fn(
+                                logits.view(-1, logits.size(-1)),
+                                targets[task].view(-1)
+                            )
+                        else:
+                            task_loss = loss_fn(logits, targets[task])
+                    else:
+                        task_loss = loss_fn(outputs[task], targets[task])
+                    
+                    # Apply task weight if specified
+                    task_weight = self.loss_kwargs[task].get('weight', 1.0)
+                    batch_loss += task_weight * task_loss
+            
+            # Backward pass
+            batch_loss.backward()
+            self.optimizer.step()
+            
+            # Update tracking
+            epoch_loss += batch_loss.item()
+            
+            # Print progress
+            if (batch_idx + 1) % max(1, num_batches // 10) == 0:
+                elapsed = time.time() - start_time
+                print(f"Epoch {epoch} | Batch {batch_idx+1}/{num_batches} | "
+                      f"Loss: {batch_loss.item():.4f} | "
+                      f"Time: {elapsed:.2f}s")
         
-        return dataloader
+        avg_epoch_loss = epoch_loss / num_batches
+        print(f"Epoch {epoch} complete | Avg Loss: {avg_epoch_loss:.4f}")
+        return avg_epoch_loss
+
+    def validate(self, epoch):
+        """Run validation using the Validation class"""
+        # Since both trainers will share the model, ensure it's using the latest weights
+        self.validation.model = self.model
+        self.model.eval()  # Set to evaluation mode
+        
+        # Run validation
+        val_metrics = self.validation.get_validation_metrics()
+        
+        # Calculate and add validation loss
+        val_loss = self.calculate_validation_loss()
+        val_metrics['val_loss'] = val_loss
+        
+        # Print validation results
+        print(f"Validation Epoch {epoch} | Val Loss: {val_loss:.4f}")
+        metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in val_metrics.items()])
+        print(f"Metrics: {metric_str}")
+        
+        return val_metrics
     
-    def save_checkpoint(self, path):
-        """Save model checkpoint"""
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+    def calculate_validation_loss(self):
+        """Calculate validation loss separately"""
+        val_loss = 0
+        self.model.eval()
         
-        # Create checkpoint
+        with torch.no_grad():
+            for batch in self.validation.val_dataloader:
+                inputs, targets = self.get_inputs_targets(batch)
+                outputs = self.model(**inputs)
+                
+                # Calculate batch loss
+                batch_loss = 0
+                for task, loss_fn in self.loss_fns.items():
+                    if task in outputs and task in targets:
+                        # For CrossEntropyLoss, reshape if needed
+                        if isinstance(loss_fn, torch.nn.CrossEntropyLoss):
+                            logits = outputs[task]
+                            if len(logits.shape) == 3:  # [batch_size, seq_len, vocab_size]
+                                task_loss = loss_fn(
+                                    logits.view(-1, logits.size(-1)),
+                                    targets[task].view(-1)
+                                )
+                            else:
+                                task_loss = loss_fn(logits, targets[task])
+                        else:
+                            task_loss = loss_fn(outputs[task], targets[task])
+                        
+                        task_weight = self.loss_kwargs[task].get('weight', 1.0)
+                        batch_loss += task_weight * task_loss
+                
+                val_loss += batch_loss.item()
+        
+        return val_loss / len(self.validation.val_dataloader)
+
+    def save_checkpoint(self, epoch, metrics, is_best=False):
+        """Save model checkpoint"""
         checkpoint = {
-            'epoch': self.current_epoch,
+            'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'best_val_metric': self.best_val_metric,
-            'train_losses': self.train_losses,
-            'val_metrics': self.val_metrics
+            'metrics': metrics,
+            'config': self.config,
         }
         
-        # Add scheduler state if it exists
-        if self.scheduler is not None:
+        if self.scheduler:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-            
-        # Save checkpoint
-        torch.save(checkpoint, path)
-        print(f"Checkpoint saved to {path}")
         
-    def load_checkpoint(self, path):
-        """Load model checkpoint"""
-        if not os.path.exists(path):
-            print(f"Checkpoint not found: {path}")
-            return False
-            
-        # Load checkpoint
-        checkpoint = torch.load(path, map_location=self.device)
+        # Regular checkpoint
+        checkpoint_path = os.path.join(self.save_dir, f'checkpoint_epoch_{epoch}.pt')
+        torch.save(checkpoint, checkpoint_path)
         
-        # Load model state
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Best checkpoint
+        if is_best:
+            best_path = os.path.join(self.save_dir, 'best_model.pt')
+            torch.save(checkpoint, best_path)
+            print(f"Saved best model checkpoint to {best_path}")
         
-        # Load optimizer state
-        if 'optimizer_state_dict' in checkpoint and self.optimizer is not None:
-            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            
-        # Load scheduler state
-        if 'scheduler_state_dict' in checkpoint and self.scheduler is not None:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-            
-        # Load training state
-        self.current_epoch = checkpoint.get('epoch', 0) + 1  # Start from next epoch
-        self.best_val_metric = checkpoint.get('best_val_metric', float('inf'))
-        self.train_losses = checkpoint.get('train_losses', [])
-        self.val_metrics = checkpoint.get('val_metrics', {})
-        
-        print(f"Checkpoint loaded from {path}")
-        return True 
+        return checkpoint_path
 
-    def save_training_visualization(self, history, filename="training_history.png"):
-        """
-        Save training history visualization to the storage directory.
+    def train(self):
+        """Train the model for the specified number of epochs"""
+        num_epochs = self.config.get('trainer_kwargs', {}).get('epochs', 100)
+        save_every = self.config.get('trainer_kwargs', {}).get('save_every', 10)
         
-        Args:
-            history: Training history dictionary containing metrics
-            filename: Name of the output file
+        print(f"Starting training for {num_epochs} epochs")
         
-        Returns:
-            Path to the saved visualization file
-        """
-        import matplotlib.pyplot as plt
+        for epoch in range(1, num_epochs + 1):
+            print(f"\n{'='*20} Epoch {epoch}/{num_epochs} {'='*20}")
+            
+            # Train one epoch
+            train_loss = self.train_one_epoch(epoch)
+            
+            # Validate
+            val_metrics = self.validate(epoch)
+            val_loss = val_metrics['val_loss']
+            
+            # Check if this is the best model
+            is_best = val_loss < self.best_val_loss
+            if is_best:
+                self.best_val_loss = val_loss
+                self.best_epoch = epoch
+                self.early_stop_counter = 0
+                print(f"New best model! Val Loss: {val_loss:.4f}")
+            else:
+                self.early_stop_counter += 1
+                print(f"Not improved for {self.early_stop_counter} epochs. Best: {self.best_val_loss:.4f} at epoch {self.best_epoch}")
+            
+            # Save checkpoint if needed
+            if epoch % save_every == 0 or is_best:
+                self.save_checkpoint(epoch, val_metrics, is_best)
+            
+            # Update learning rate scheduler
+            if self.scheduler:
+                if isinstance(self.scheduler, ReduceLROnPlateau):
+                    self.scheduler.step(val_loss)
+                else:
+                    self.scheduler.step()
+                
+                # Print current learning rate
+                current_lr = self.optimizer.param_groups[0]['lr']
+                print(f"Current learning rate: {current_lr:.6f}")
+            
+            # Early stopping check
+            if self.early_stop_counter >= self.early_stop_patience:
+                print(f"Early stopping triggered after {epoch} epochs")
+                break
         
-        # Get storage path from config
-        storage_root = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-            "storage"
-        )
-        
-        # Use project name and version from config for subfolder structure
-        project_name = self.config.get("project_name", "default_project")
-        version = self.config.get("version", "v1.0")
-        if "experiment_tracking" in self.config:
-            project_name = self.config["experiment_tracking"].get("project_name", project_name)
-            version = self.config["experiment_tracking"].get("version", version)
-        
-        # Create directory structure
-        save_dir = os.path.join(storage_root, project_name, version, "visualizations")
-        os.makedirs(save_dir, exist_ok=True)
-        
-        # Full path for the output file
-        output_path = os.path.join(save_dir, filename)
-        
-        # Create the visualization
-        plt.figure(figsize=(12, 4))
-        
-        # Plot training loss
-        plt.subplot(1, 2, 1)
-        plt.plot(history.get('train_loss', []), label='Train Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training Loss')
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        
-        # Plot validation metrics
-        plt.subplot(1, 2, 2)
-        metrics = self.config.get('metrics', ['loss'])
-        for metric in metrics:
-            values = []
-            for epoch_metrics in history.get('val_metrics', []):
-                values.append(epoch_metrics.get(metric, float('nan')))
-            plt.plot(values, label=f'Val {metric}')
-        
-        plt.xlabel('Epoch')
-        plt.ylabel('Metric Value')
-        plt.title('Validation Metrics')
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        
-        # Add a suptitle with project and version
-        plt.suptitle(f"Training Results - {project_name} ({version})")
-        plt.tight_layout()
-        
-        # Save the figure
-        plt.savefig(output_path, dpi=300)
-        plt.close()
-        
-        print(f"Training visualization saved to {output_path}")
-        
-        # Log the visualization to MLflow if enabled
-        if hasattr(self, 'tracker') and self.tracker and self.config.get("experiment_tracking", {}).get("enable", False):
-            self.tracker.log_artifact(output_path)
-            print(f"Training visualization logged to MLflow")
-        
-        return output_path 
-    
+        print(f"\nTraining completed. Best model at epoch {self.best_epoch} with val_loss: {self.best_val_loss:.4f}")
+        return self.best_val_loss
+
+    def get_validation_metrics(self):
+        """Run validation and return metrics"""
+        return self.validation.get_validation_metrics()

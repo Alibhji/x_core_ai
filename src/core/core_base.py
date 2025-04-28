@@ -8,8 +8,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, DistributedSampler
 import torch.distributed as dist
 import x_core_ai
+from x_core_ai.src.models.tokenizer_zoo import TokenizerZoo
 from typing import Dict, Tuple, Any, Optional
 from x_core_ai.src.utils.model_utils import analyze_model_size, load_weights
+from .utils import custom_collate_fn
+
+
 
 class Core:
     def __init__(self, config, package_name='x_core_ai.src'):
@@ -18,7 +22,9 @@ class Core:
         self.setup_device()
         self.setup_package(package_name)
         self.dataloaders = {}
-        
+        # self.tokenizer = self.get_tokenizer()
+        self.tokenizer = TokenizerZoo.get_tokenizer(self.config['tokenizer_name'])
+
     def setup_device(self):
         """Setup compute device (CPU/GPU)"""
         gpus = self.config.get('gpus', list(range(torch.cuda.device_count())))
@@ -26,6 +32,10 @@ class Core:
         self.device = torch.device(f"cuda:{primary_gpu}" if torch.cuda.is_available() else "cpu")
         if self.config.get('distributed', False):
             self.device = f"cuda:{primary_gpu}"
+
+    def get_tokenizer(self):
+        """Get tokenizer from registry"""
+        return x_core_ai.src.tokenizers.registry.get_tokenizer(self.config['tokenizer_name'])
             
     def setup_package(self, package_name):
         """Setup package imports and paths"""
@@ -89,7 +99,7 @@ class Core:
         """Get dataset from registry"""
         return x_core_ai.src.datasets.registry.get_dataset(name, *args, **kwargs)
     
-    def get_dataframe(self, name, *args, **kwargs):
+    def _get_dataframe(self, name, *args, **kwargs):
         """Get dataframe from registry"""
         return x_core_ai.src.dataframes.registry.get_dataframe(name, *args, **kwargs)
         
@@ -102,7 +112,7 @@ class Core:
             primary_key = batch.pop('primary_key', None)
         return primary_key, batch
     
-    def get_dataframes(self):
+    def create_dataframes(self):
         """Get dataframes from registry based on config"""
         if not self.config.get('data_name'):
             return None, None, None
@@ -110,15 +120,15 @@ class Core:
         if isinstance(self.config['data_name'], list):
             dataframes = []
             for i, name in enumerate(self.config['data_name']):
-                kwargs_name = 'dataframe_kwargs'
+                kwargs_name = 'data_kwargs'
                 str_ = f'_{i}' if i != 0 else ''
                 kwargs_name += str_
-                dataframes.append(self.get_dataframe(name, **self.config[kwargs_name]))
+                dataframes.append(self._get_dataframe(name, **self.config[kwargs_name]))
             df_train = pd.concat([df_.df_train for df_ in dataframes])
             df_val = pd.concat([df_.df_val for df_ in dataframes])
             df_test = pd.concat([df_.df_test for df_ in dataframes])
         else:
-            dataframe = self.get_dataframe(self.config['data_name'], **self.config['dataframe_kwargs'])
+            dataframe = self._get_dataframe(self.config['data_name'], **self.config['data_kwargs'])
             df_train = dataframe.df_train
             df_test = dataframe.df_test
             df_val = getattr(dataframe, 'df_val', df_test)  # Use df_test as fallback if df_val doesn't exist
@@ -127,12 +137,9 @@ class Core:
     
     def create_dataset(self, df=None, train=True):
         """Create dataset from dataframe"""
-        if not self.config.get('dataset_name'):
-            return None
-            
         # Get dataframe if not provided
         if df is None:
-            df_train, df_val, df_test = self.get_dataframes()
+            df_train, df_val, df_test = self.create_dataframes()
             df = df_train if train else df_val
             
         if df is None:
@@ -143,30 +150,16 @@ class Core:
             self.config['dataset_name'],
             df=df,
             train=train,
-            **self.config.get('dataset_kwargs', {})
-        )
+            **self.config['dataset_kwargs'])
+            
         
         return dataset
     
-    def create_dataloader(self, dataset=None, train=True, batch_size=None, shuffle=None):
+    def create_dataloader(self, dataset, train=True, batch_size=None, shuffle=None):
         """Create dataloader from dataset"""
-        if dataset is None:
-            dataset = self.create_dataset(train=train)
-            
-        if dataset is None:
-            return None
-            
         # Get dataloader parameters
-        if train:
-            dataloader_kwargs = self.config.get('dataloader_kwargs_train', {}).copy()
-        else:
-            dataloader_kwargs = self.config.get('dataloader_kwargs_val', {}).copy()
-            
-        # Override batch size and shuffle if provided
-        if batch_size is not None:
-            dataloader_kwargs['batch_size'] = batch_size
-        if shuffle is not None:
-            dataloader_kwargs['shuffle'] = shuffle
+        dataloader_kwargs = self.config[f'{"train" if train else "val"}_dataloader_kwargs'].copy()
+
             
         # Create sampler for distributed training
         sampler = None
@@ -180,63 +173,86 @@ class Core:
             dataloader_kwargs.pop('shuffle', None)  # Remove shuffle if using sampler
             
         # Create dataloader
+        dataloader_kwargs = self.config['train_dataloader_kwargs'] if train else self.config['val_dataloader_kwargs']
+        shuffle = dataloader_kwargs.pop('shuffle', True)
         dataloader = DataLoader(
-            dataset,
+            dataset, 
             sampler=sampler,
-            collate_fn=getattr(dataset, 'collate_fn', None),
-            **dataloader_kwargs
-        )
-        
-        # Cache dataloader for reuse
-        cache_key = f"{'train' if train else 'val'}_dataloader"
-        self.dataloaders[cache_key] = dataloader
+            shuffle= shuffle if (sampler is None or train) else False, # if sampler is not None, then shuffle is False or if val then False
+            **dataloader_kwargs,
+            collate_fn= custom_collate_fn)
         
         return dataloader
     
-    def get_train_dataloader(self, force_new=False):
+    # def get_train_dataloader(self):
+    #     """Get training dataloader"""
+    #     dataframe = self.get_dataframe(self.config['data_name'], **self.config['data_kwargs']) 
+    #     dataset = self.get_dataset(self.config['dataset_name'], 
+    #                                   df=dataframe.df_train, 
+    #                                   train=True, 
+    #                                   **self.config['dataset_kwargs'])
+
+    #     dataloader = torch.utils.data.DataLoader(
+    #         dataset, 
+    #         **self.config['trainer_kwargs']['train_dataloader_kwargs'],
+    #         collate_fn= custom_collate_fn)
+    #     return dataloader
+    
+
+    # def get_val_dataloader(self):
+    #     """Get validation dataloader"""
+    #     dataframe = self.get_dataframe(self.config['data_name'], **self.config['data_kwargs']) 
+    #     dataset = self.get_dataset(self.config['dataset_name'], 
+    #                                   df=dataframe.df_val, 
+    #                                   train=False, 
+    #                                   **self.config['dataset_kwargs'])
+
+    #     dataloader = torch.utils.data.DataLoader(
+    #         dataset, 
+    #         **self.config['trainer_kwargs']['val_dataloader_kwargs'],
+    #         collate_fn= custom_collate_fn)
+    #     return dataloader
+    
+    def get_train_dataloader(self):
         """Get training dataloader"""
-        if not force_new and 'train_dataloader' in self.dataloaders:
-            return self.dataloaders['train_dataloader']
         return self.create_dataloader(train=True)
     
-    def get_val_dataloader(self, force_new=False):
+    def get_val_dataloader(self):
         """Get validation dataloader"""
-        if not force_new and 'val_dataloader' in self.dataloaders:
-            return self.dataloaders['val_dataloader']
         return self.create_dataloader(train=False)
     
-    @staticmethod
-    def custom_collate_fn(batch):
-        """Custom collate function for DataLoader"""
-        collated_batch = {}
-        # Get all keys in the dataset
-        keys = batch[0].keys()
+    # @staticmethod
+    # def custom_collate_fn(batch):
+    #     """Custom collate function for DataLoader"""
+    #     collated_batch = {}
+    #     # Get all keys in the dataset
+    #     keys = batch[0].keys()
 
-        for key in keys:
-            values = [sample[key] for sample in batch]
+    #     for key in keys:
+    #         values = [sample[key] for sample in batch]
 
-            if isinstance(values[0], np.ndarray):
-                try:
-                    collated_batch[key] = torch.as_tensor(np.stack(values))
-                except:
-                    print('issue in stacking arrays')
+    #         if isinstance(values[0], np.ndarray):
+    #             try:
+    #                 collated_batch[key] = torch.as_tensor(np.stack(values))
+    #             except:
+    #                 print('issue in stacking arrays')
 
-            elif isinstance(values[0], (int, float)):  # Handle numerical values
-                collated_batch[key] = torch.tensor(values)
+    #         elif isinstance(values[0], (int, float)):  # Handle numerical values
+    #             collated_batch[key] = torch.tensor(values)
                 
-            elif isinstance(values[0], (torch.Tensor, np.ndarray)):
-                values = [torch.tensor(v) if isinstance(v, np.ndarray) else v for v in values]
-                collated_batch[key] = torch.stack(values)  # Stack tensors
+    #         elif isinstance(values[0], (torch.Tensor, np.ndarray)):
+    #             values = [torch.tensor(v) if isinstance(v, np.ndarray) else v for v in values]
+    #             collated_batch[key] = torch.stack(values)  # Stack tensors
 
-            elif isinstance(values[0], (str, list)):  # Handle strings/lists
-                collated_batch[key] = values  # Keep them as lists
+    #         elif isinstance(values[0], (str, list)):  # Handle strings/lists
+    #             collated_batch[key] = values  # Keep them as lists
                 
-            elif isinstance(values[0], dict):
-                collated_batch[key] = Core.custom_collate_fn(values)
-            else:
-                raise TypeError(f"Unsupported data type for key '{key}': {type(values[0])}")
+    #         elif isinstance(values[0], dict):
+    #             collated_batch[key] = Core.custom_collate_fn(values)
+    #         else:
+    #             raise TypeError(f"Unsupported data type for key '{key}': {type(values[0])}")
 
-        return collated_batch
+    #     return collated_batch
     
     @staticmethod
     def load_model_weights(model, weights_path):

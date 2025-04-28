@@ -30,7 +30,7 @@ def validation_demo():
         
         # Data configuration
         "data_name": "dummy_dataframe",
-        "dataframe_kwargs": {
+        "data_kwargs": {
             "photo_feature_sequence_length": sequence_length,
             "photo_feature_dim": feature_dim,
             "target_name": "cost_target",

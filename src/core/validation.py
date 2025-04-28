@@ -1,215 +1,91 @@
+from .core_base import Core
 import torch
-import numpy as np
-from sklearn import metrics
-from .forecast import Forecast
+from .metrics import Metrics
 
-class Validation(Forecast):
-    def __init__(self, config, package_name='x_core_ai.src'):
-        """Validation class for model evaluation"""
+class Validation(Core):
+    """Validation class for model validation"""
+
+    def __init__(self, config, 
+                 package_name='x_core_ai.src',
+                 df_val=None,
+                 val_dataloader=None):
         super().__init__(config, package_name)
-        self.metrics_functions = self._get_metrics_functions()
-        
-    def _get_metrics_functions(self):
-        """Get metric functions based on config"""
-        metric_dict = {}
-        
-        # Get metrics from config or use defaults
-        metric_names = self.config.get('metrics', ['mse', 'mae'])
-        
-        for metric in metric_names:
-            if metric.lower() == 'mse':
-                metric_dict['mse'] = metrics.mean_squared_error
-            elif metric.lower() == 'mae':
-                metric_dict['mae'] = metrics.mean_absolute_error
-            elif metric.lower() == 'rmse':
-                metric_dict['rmse'] = lambda y_true, y_pred: np.sqrt(metrics.mean_squared_error(y_true, y_pred))
-            elif metric.lower() == 'r2':
-                metric_dict['r2'] = metrics.r2_score
-            elif metric.lower() == 'accuracy':
-                metric_dict['accuracy'] = metrics.accuracy_score
-            elif metric.lower() == 'f1':
-                metric_dict['f1'] = metrics.f1_score
-            elif metric.lower() == 'precision':
-                metric_dict['precision'] = metrics.precision_score
-            elif metric.lower() == 'recall':
-                metric_dict['recall'] = metrics.recall_score
-                
-        return metric_dict
-    
-    def evaluate(self, dataloader=None):
-        """
-        Evaluate model on a dataloader
-        Args:
-            dataloader: DataLoader with validation data (uses default val dataloader if None)
-        Returns:
-            Dictionary of evaluation metrics
-        """
-        # Get dataloader if not provided
-        if dataloader is None:
-            dataloader = self.get_val_dataloader()
-            
-        if dataloader is None:
-            raise ValueError("No validation dataloader available")
-            
-        all_predictions = []
-        all_targets = []
-        
-        # Get predictions and targets
+        self.setup_model()
+        if df_val is None and val_dataloader is None:
+            df = self._get_dataframe(self.config['data_name'], **self.config['data_kwargs'])
+            dataset = self.create_dataset(df.df_val, train=False)
+            self.val_dataloader = self.create_dataloader(dataset, train=False)
+        elif df_val is not None:
+            dataset = self.create_dataset(df_val, train=False)
+            self.val_dataloader = self.create_dataloader(dataset, train=False)
+        elif val_dataloader is not None:
+            self.val_dataloader = val_dataloader
+        print("length of val_dataloader: ", len(self.val_dataloader))
+
+    def setup_model(self):
+        """Setup model for inference"""
+        self.model_generator()
+        self.model_to_device()
         self.model.eval()
-        with torch.no_grad():
-            for batch in dataloader:
-                # Extract targets from batch
-                if isinstance(batch, dict):
-                    target_name = self.config.get('target_name', 'cost_target')
-                    if target_name in batch:
-                        targets = batch[target_name]
-                        # For GCAN models, ensure we use photo_feat as input
-                        if 'photo_feat' in batch and self.config.get('model_name') == 'gated_cross_attention':
-                            inputs = batch['photo_feat']
-                        else:
-                            inputs = {k: v for k, v in batch.items() if k != target_name}
-                    else:
-                        # Try common fallbacks
-                        targets = batch.get('target', None)
-                        inputs = batch.get('photo_feat', batch)
-                        if targets is None:
-                            # Try first non-photo_feat key as target
-                            for k, v in batch.items():
-                                if k != 'photo_feat':
-                                    targets = v
-                                    break
-                else:
-                    # Handle tuple of (inputs, targets)
-                    inputs, targets = batch
-                
-                # Move inputs to device
-                if isinstance(inputs, dict):
-                    inputs = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                             for k, v in inputs.items()}
-                elif isinstance(inputs, torch.Tensor):
-                    inputs = inputs.to(self.device)
-                
-                # Handle targets
-                if targets is None:
-                    print("Warning: No targets found in batch, skipping")
-                    continue
-                    
-                if isinstance(targets, torch.Tensor):
-                    targets = targets.to(self.device)
-                
-                # Get predictions
-                outputs = self.model(inputs)
-                predictions = self.process_outputs(outputs)
-                
-                # Convert targets to numpy if needed
-                if isinstance(targets, torch.Tensor):
-                    targets = targets.cpu().numpy()
-                
-                # Ensure predictions and targets have consistent shapes
-                if len(predictions.shape) == 1:
-                    predictions = predictions.reshape(-1, 1)
-                if len(targets.shape) == 1:
-                    targets = targets.reshape(-1, 1)
-                
-                all_predictions.append(predictions)
-                all_targets.append(targets)
+        print("Model setup complete")
+
+    def get_inputs_targets(self, batch, drop_keys=[]):
+        """Get inputs and targets from batch"""
+        inputs = batch['inputs']
+        targets = batch['targets']  
+        # to device
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        targets = {k: v.to(self.device) for k, v in targets.items()}
+        if drop_keys:
+            for key in drop_keys:
+                if key in inputs:
+                    inputs.pop(key)
+        return inputs, targets
+
+    # @torch.no_grad()
+    def one_eopch_validation(self, convert_to_string=False):
+        """One epoch of validation"""
+        self.metrics = Metrics(metrics_kwargs=self.config.get('metrics_kwargs', {}))
+        all_results = {}
         
-        # Combine predictions and targets
-        if all(isinstance(p, np.ndarray) for p in all_predictions):
-            try:
-                all_predictions = np.vstack(all_predictions)
-            except ValueError as e:
-                print(f"Warning: Unable to vstack predictions due to inconsistent shapes: {e}")
-                # Try concatenating along axis 0 without requiring same shape along other dimensions
-                all_predictions = np.concatenate([p.reshape(p.shape[0], -1) for p in all_predictions], axis=0)
-                
-        if all(isinstance(t, np.ndarray) for t in all_targets):
-            try:
-                all_targets = np.vstack(all_targets)
-            except ValueError as e:
-                print(f"Warning: Unable to vstack targets due to inconsistent shapes: {e}")
-                # Try concatenating along axis 0 without requiring same shape along other dimensions
-                all_targets = np.concatenate([t.reshape(t.shape[0], -1) for t in all_targets], axis=0)
+        for i,batch in enumerate(self.val_dataloader):
+            print(f"Batch {i+1} of {len(self.val_dataloader)}")
+            inputs, targets = self.get_inputs_targets(batch, drop_keys=['tgt_title'])
+            # Get model outputs - could be a dictionary with both tokens and logits
+            outputs = self.model.generate(**inputs)
+            # Calculate metrics using appropriate output types
+            batch_results = self.metrics.calculate_metrics(targets, outputs)
+            for key, value in batch_results.items():
+                if key not in all_results:
+                    all_results[key] = []
+                all_results[key].append(value)
             
-        # Calculate metrics
-        metrics_results = self.calculate_metrics(all_targets, all_predictions)
-        return metrics_results
-    
-    def calculate_metrics(self, targets, predictions):
+            print(self.metrics.get_metric_string(batch_metrics=True))
+            
+            # Convert token IDs to strings if needed
+            if convert_to_string:
+                for task in outputs:
+                    if task in ['title'] and isinstance(outputs[task], torch.Tensor):
+                        outputs[f"{task}_text"] = self.tokenizer.decode(outputs[task], skip_special_tokens=True)
+            
+        print(self.metrics.get_metric_string(batch_metrics=False))
+        return all_results
+        
+
+    def get_validation_metrics(self):
         """
-        Calculate evaluation metrics
-        Args:
-            targets: Ground truth values
-            predictions: Model predictions
+        Run validation and return metrics
+        
         Returns:
-            Dictionary of metric values
+            Dictionary of metrics with keys like 'title_BLEU', 'title_accuracy'
         """
-        results = {}
+        with torch.no_grad():
+            results = self.one_eopch_validation()
         
-        for metric_name, metric_fn in self.metrics_functions.items():
-            try:
-                # Handle different metric requirements
-                if metric_name in ['accuracy', 'f1', 'precision', 'recall']:
-                    # Classification metrics might need class predictions
-                    if predictions.ndim > 1 and predictions.shape[1] > 1:
-                        # Convert probabilities to class predictions
-                        class_predictions = np.argmax(predictions, axis=1)
-                    else:
-                        # Binary classification with threshold 0.5
-                        class_predictions = (predictions > 0.5).astype(int)
-                    
-                    if metric_name == 'f1' or metric_name == 'precision' or metric_name == 'recall':
-                        # These need average parameter
-                        result = metric_fn(targets, class_predictions, average='macro')
-                    else:
-                        result = metric_fn(targets, class_predictions)
-                else:
-                    # Regression metrics
-                    # Ensure consistent shapes for regression metrics
-                    if predictions.ndim > 1 and targets.ndim == 1:
-                        predictions = predictions.squeeze()
-                    elif targets.ndim > 1 and predictions.ndim == 1:
-                        targets = targets.squeeze()
-                    
-                    # If shapes still don't match, flatten both
-                    if predictions.shape != targets.shape:
-                        predictions = predictions.flatten()
-                        targets = targets.flatten()
-                        
-                    result = metric_fn(targets, predictions)
-                    
-                results[metric_name] = result
-            except Exception as e:
-                print(f"Error calculating {metric_name}: {e}")
-                results[metric_name] = float('nan')
-                
-        return results
+        # Calculate mean for each metric
+        final_metrics = {}
+        for key, values in results.items():
+            if values:  # Check if values exist
+                final_metrics[key] = torch.tensor(values).mean().item()
         
-    def get_dataloader(self, dataset=None):
-        """Get validation dataloader"""
-        if dataset is None:
-            # Load validation dataset from config
-            if self.config.get('dataset_name') and self.config.get('dataset_kwargs'):
-                df_val = None
-                if self.config.get('data_name'):
-                    dataframe = self.get_dataframe(self.config['data_name'], 
-                                                  **self.config.get('dataframe_kwargs', {}))
-                    df_val = dataframe.df_val
-                    
-                dataset = self.get_dataset(self.config['dataset_name'], 
-                                          df=df_val, 
-                                          train=False, 
-                                          **self.config.get('dataset_kwargs', {}))
-                
-        if dataset is None:
-            raise ValueError("No validation dataset provided")
-            
-        # Create dataloader
-        batch_size = self.config.get('dataloader_kwargs_val', {}).get('batch_size', 32)
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=batch_size,
-            **{k: v for k, v in self.config.get('dataloader_kwargs_val', {}).items() if k != 'batch_size'}
-        )
-        
-        return dataloader 
+        return final_metrics

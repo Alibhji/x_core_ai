@@ -1,0 +1,108 @@
+project_name: multi_task_vit_v1.0.0
+description: Multi-Task ViT for cost prediction
+date: 2025-04-23
+author: Ali Bhji
+
+distributed: False
+tokenizer_name: bert-base-uncased
+dist_kwargs:
+    local_rank: 0
+    world_size: 1
+gpus: [0]
+targets: ['title'] #, 'description', 'tags', 'category']
+
+#  For your title generation task:
+# ✅ Token-level accuracy — for quick checks
+# ✅ BLEU — for how close the whole sequence is
+# ✅ ROUGE — especially for titles (short and meaningful)
+# ✅ Perplexity — to monitor how "easy" prediction is becoming
+
+metrics_kwargs:
+    title:
+        metrics: [accuracy, BLEU] # METEOR, SacreBLEU, SacreBLEU-detok, SacreBLEU-detok-smooth, SacreBLEU-detok-smooth-tokenized , CIDEr, perplexity] # ROUGE 
+
+loss_kwargs:
+    title:
+        weight: 1.0
+        loss_fn: CrossEntropyLoss
+        ignore_index: 0
+    # description:
+    #     weight: 1.0
+    #     loss_fn: CrossEntropyLoss
+    # tags:
+    #     weight: 1.0
+    #     loss_fn: BCEWithLogitsLoss
+    # category:
+    #     weight: 1.0
+    #     loss_fn: CrossEntropyLoss
+
+model_name: vit_encoder_decoder
+model_kwargs:
+    vocab_size: 30522
+    hidden_size: 768
+    freeze_vit_encoder: True
+
+train_dataloader_kwargs:
+    batch_size: 2
+    num_workers: 4
+    pin_memory: True
+    shuffle: True
+val_dataloader_kwargs:
+    batch_size: 2
+    num_workers: 4
+    pin_memory: True
+    shuffle: False
+
+trainer_kwargs:
+    epochs: 100
+    monitor_metric: $monitor_metric
+    learning_rate: 0.001
+    weight_decay: 0.01
+
+    optimizer: adam
+    optimizer_kwargs:
+        lr: 0.001
+        weight_decay: 0.01
+        betas: [0.9, 0.999]
+        eps: 1e-8
+
+    scheduler: cosine
+    scheduler_kwargs:
+        mode: "min"
+        factor: 0.1
+        patience: 10
+        verbose: True
+    early_stopping_kwargs:
+        patience: 20
+        min_delta: 0.001  
+
+    metrics:
+        - "mse"
+        - "mae"
+        - "r2"
+    save_dir: "checkpoints"
+    save_every: 10
+
+data_name: dummy_image_dataframe
+data_kwargs:
+    number_of_samples: 100
+    max_title_length: 100
+    sequence_length: 4
+    train_portion: 0.5
+    val_portion: 0.4
+    test_portion: 0.1
+
+dataset_name: image_dataset
+dataset_kwargs:
+    sequence_length: 40
+    storage_path: r"$root_path\$project_name\data"
+    tokenizer_name: $tokenizer_name
+    image_size: 224
+
+
+root_path: C:\Users\alibh\Desktop\projects\python\x_core_ai\storage
+storage_path: r"$root_path\$project_name\data"
+model_checkpoint_path: r"$root_path\$project_name\checkpoints"
+
+
+
