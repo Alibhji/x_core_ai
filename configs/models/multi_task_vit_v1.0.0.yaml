@@ -37,6 +37,7 @@ loss_kwargs:
     #     loss_fn: CrossEntropyLoss
 
 model_name: vit_encoder_decoder
+checkpoint_weight_path: C:\Users\alibh\Desktop\projects\python\x_core_ai\storage\multi_task_vit_v1.0.0\checkpoints\multi_task_vit_v1.0.0\best_model.pt
 model_kwargs:
     vocab_size: 30522
     hidden_size: 768

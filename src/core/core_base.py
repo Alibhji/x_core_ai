@@ -64,8 +64,12 @@ class Core:
         """Generate and initialize model"""
         self.model = self.get_model(self.config["model_name"], 
                                **self.config["model_kwargs"])
-        if self.config.get('weights_path'):
-            self.load_model_weights(self.model, self.config.get('weights_path'))
+        
+        # Load weights if specified in config
+        weights_path = self.config.get('checkpoint_weight_path')
+        if weights_path is not None:
+            self.load_model_weights(self.model, weights_path)
+            print(f"Loaded model weights from {weights_path}")
         
         # Analyze and print model statistics
         analyze_model_size(self.model)
@@ -261,12 +265,42 @@ class Core:
             print(f"Weights file not found: {weights_path}")
             return
             
-        state_dict = torch.load(weights_path, map_location='cpu')
+        # Add datetime.date to safe globals before attempting to load
+        from datetime import date
+        torch.serialization.add_safe_globals([date])
+            
+        try:
+            # First try loading with weights_only=True (default in PyTorch 2.6+)
+            checkpoint = torch.load(weights_path, map_location='cpu', weights_only=True)
+        except Exception as e:
+            print(f"Initial load failed, attempting to load with weights_only=False: {str(e)}")
+            try:
+                checkpoint = torch.load(weights_path, map_location='cpu', weights_only=False)
+            except Exception as e:
+                print(f"Failed to load weights: {str(e)}")
+                return
+            
+        # Extract model state dict from checkpoint
+        if isinstance(checkpoint, dict):
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            else:
+                state_dict = checkpoint
+        else:
+            state_dict = checkpoint
+            
         # Handle module. prefix from DataParallel
         if list(state_dict.keys())[0].startswith('module.'):
             state_dict = {k[7:]: v for k, v in state_dict.items()}
             
-        model.load_state_dict(state_dict, strict=False)
+        # Load state dict with strict=False to handle missing keys
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        if missing_keys:
+            print(f"Some weights were not initialized from the checkpoint: {missing_keys}")
+            print("You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.")
+        if unexpected_keys:
+            print(f"Some weights from the checkpoint were not used: {unexpected_keys}")
+            
         print(f"Loaded model weights from {weights_path}")
     
     @staticmethod

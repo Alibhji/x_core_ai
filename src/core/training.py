@@ -5,6 +5,8 @@ from .validation import Validation
 import os
 import time
 from torch.optim.lr_scheduler import CosineAnnealingLR, ReduceLROnPlateau
+from ..models.optimizer_zoo import OptimizerZoo
+from ..models.scheduler_zoo import SchedulerZoo
 
 class Training(Core):
     """Training class for model training"""
@@ -73,34 +75,12 @@ class Training(Core):
 
     def setup_optimizer(self):
         """Setup optimizer based on config"""
-        optimizer_name = self.config.get('trainer_kwargs', {}).get('optimizer', 'adam').lower()
-        optimizer_kwargs = self.config.get('trainer_kwargs', {}).get('optimizer_kwargs', {})
+        optimizer_name = self.config['trainer_kwargs']['optimizer']
+        optimizer_kwargs = self.config['trainer_kwargs']['optimizer_kwargs']
         
-        if optimizer_name == 'adam':
-            self.optimizer = torch.optim.Adam(
-                self.model.parameters(),
-                lr=optimizer_kwargs.get('lr', 0.001),
-                weight_decay=optimizer_kwargs.get('weight_decay', 0.01),
-                betas=optimizer_kwargs.get('betas', (0.9, 0.999)),
-                eps=optimizer_kwargs.get('eps', 1e-8)
-            )
-        elif optimizer_name == 'adamw':
-            self.optimizer = torch.optim.AdamW(
-                self.model.parameters(),
-                lr=optimizer_kwargs.get('lr', 0.001),
-                weight_decay=optimizer_kwargs.get('weight_decay', 0.01),
-                betas=optimizer_kwargs.get('betas', (0.9, 0.999)),
-                eps=optimizer_kwargs.get('eps', 1e-8)
-            )
-        elif optimizer_name == 'sgd':
-            self.optimizer = torch.optim.SGD(
-                self.model.parameters(),
-                lr=optimizer_kwargs.get('lr', 0.01),
-                momentum=optimizer_kwargs.get('momentum', 0.9),
-                weight_decay=optimizer_kwargs.get('weight_decay', 0.0001)
-            )
-        else:
-            raise ValueError(f"Unsupported optimizer: {optimizer_name}")
+        # Create optimizer using OptimizerZoo with config parameters
+        optimizer_zoo = OptimizerZoo(optimizer_name, self.model.parameters(), **optimizer_kwargs)
+        self.optimizer = optimizer_zoo.get_instance_optimizer()
         
         print(f"Optimizer setup: {optimizer_name}")
 
@@ -126,30 +106,12 @@ class Training(Core):
 
     def setup_scheduler(self):
         """Setup learning rate scheduler based on config"""
-        scheduler_name = self.config.get('trainer_kwargs', {}).get('scheduler', None)
-        if not scheduler_name:
-            self.scheduler = None
-            return
+        scheduler_name = self.config['trainer_kwargs']['scheduler']
+        scheduler_kwargs = self.config['trainer_kwargs']['scheduler_kwargs']
         
-        scheduler_kwargs = self.config.get('trainer_kwargs', {}).get('scheduler_kwargs', {})
-        
-        if scheduler_name.lower() == 'cosine':
-            total_epochs = self.config.get('trainer_kwargs', {}).get('epochs', 100)
-            self.scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=total_epochs,
-                eta_min=scheduler_kwargs.get('eta_min', 0)
-            )
-        elif scheduler_name.lower() == 'plateau':
-            self.scheduler = ReduceLROnPlateau(
-                self.optimizer,
-                mode=scheduler_kwargs.get('mode', 'min'),
-                factor=scheduler_kwargs.get('factor', 0.1),
-                patience=scheduler_kwargs.get('patience', 10),
-                verbose=scheduler_kwargs.get('verbose', True)
-            )
-        else:
-            raise ValueError(f"Unsupported scheduler: {scheduler_name}")
+        # Create scheduler using SchedulerZoo with config parameters
+        scheduler_zoo = SchedulerZoo(scheduler_name, optimizer=self.optimizer, **scheduler_kwargs)
+        self.scheduler = scheduler_zoo.get_instance_scheduler()
         
         print(f"Scheduler setup: {scheduler_name}")
 
@@ -165,6 +127,30 @@ class Training(Core):
                 if key in inputs:
                     inputs.pop(key)
         return inputs, targets
+    
+    def calculate_loss(self, outputs, targets):
+        """Calculate loss for each task"""
+        total_loss = 0
+        for task, loss_fn in self.loss_fns.items():
+            if task in outputs and task in targets:
+                # For CrossEntropyLoss, reshape if needed
+                if isinstance(loss_fn, torch.nn.CrossEntropyLoss):
+                    logits = outputs[task]
+                    if len(logits.shape) == 3:  # [batch_size, seq_len, vocab_size]
+                        task_loss = loss_fn(
+                            logits.view(-1, logits.size(-1)),
+                            targets[task].view(-1)
+                        )
+                    else:
+                        task_loss = loss_fn(logits, targets[task])
+                else:
+                    task_loss = loss_fn(outputs[task], targets[task])
+                
+                # Apply task weight if specified
+                task_weight = self.loss_kwargs[task].get('weight', 1.0)
+                total_loss += task_weight * task_loss
+        
+        return total_loss
 
     def train_one_epoch(self, epoch):
         """Train for one epoch"""
@@ -180,26 +166,8 @@ class Training(Core):
             
             outputs = self.model(**inputs)
             
-            # Calculate loss for each task
-            batch_loss = 0
-            for task, loss_fn in self.loss_fns.items():
-                if task in outputs and task in targets:
-                    # For CrossEntropyLoss, reshape if needed
-                    if isinstance(loss_fn, torch.nn.CrossEntropyLoss):
-                        logits = outputs[task]
-                        if len(logits.shape) == 3:  # [batch_size, seq_len, vocab_size]
-                            task_loss = loss_fn(
-                                logits.view(-1, logits.size(-1)),
-                                targets[task].view(-1)
-                            )
-                        else:
-                            task_loss = loss_fn(logits, targets[task])
-                    else:
-                        task_loss = loss_fn(outputs[task], targets[task])
-                    
-                    # Apply task weight if specified
-                    task_weight = self.loss_kwargs[task].get('weight', 1.0)
-                    batch_loss += task_weight * task_loss
+            # Calculate loss using unified function
+            batch_loss = self.calculate_loss(outputs, targets)
             
             # Backward pass
             batch_loss.backward()
@@ -249,26 +217,8 @@ class Training(Core):
                 inputs, targets = self.get_inputs_targets(batch)
                 outputs = self.model(**inputs)
                 
-                # Calculate batch loss
-                batch_loss = 0
-                for task, loss_fn in self.loss_fns.items():
-                    if task in outputs and task in targets:
-                        # For CrossEntropyLoss, reshape if needed
-                        if isinstance(loss_fn, torch.nn.CrossEntropyLoss):
-                            logits = outputs[task]
-                            if len(logits.shape) == 3:  # [batch_size, seq_len, vocab_size]
-                                task_loss = loss_fn(
-                                    logits.view(-1, logits.size(-1)),
-                                    targets[task].view(-1)
-                                )
-                            else:
-                                task_loss = loss_fn(logits, targets[task])
-                        else:
-                            task_loss = loss_fn(outputs[task], targets[task])
-                        
-                        task_weight = self.loss_kwargs[task].get('weight', 1.0)
-                        batch_loss += task_weight * task_loss
-                
+                # Calculate batch loss using unified function
+                batch_loss = self.calculate_loss(outputs, targets)
                 val_loss += batch_loss.item()
         
         return val_loss / len(self.validation.val_dataloader)

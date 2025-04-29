@@ -36,32 +36,3 @@ def custom_collate_fn(batch):
 
         return collated_batch
 
-def get_metrics_functions(metric_names = ['mse', 'mae']):
-    """Get metric functions based on config
-    Args:
-        metrics: List of metrics to get functions for (default is ['mse', 'mae']) 
-        possible metrics: ['mse', 'mae', 'rmse', 'r2', 'accuracy', 'f1', 'precision', 'recall']
-    Returns:
-        Dictionary of metric functions
-    """
-    metric_dict = {}
-
-    for metric in metric_names:
-        if metric.lower() == 'mse':
-            metric_dict['mse'] = metrics.mean_squared_error
-        elif metric.lower() == 'mae':
-            metric_dict['mae'] = metrics.mean_absolute_error
-        elif metric.lower() == 'rmse':
-            metric_dict['rmse'] = lambda y_true, y_pred: np.sqrt(metrics.mean_squared_error(y_true, y_pred))
-        elif metric.lower() == 'r2':
-            metric_dict['r2'] = metrics.r2_score
-        elif metric.lower() == 'accuracy':
-            metric_dict['accuracy'] = metrics.accuracy_score
-        elif metric.lower() == 'f1':
-            metric_dict['f1'] = metrics.f1_score
-        elif metric.lower() == 'precision':
-            metric_dict['precision'] = metrics.precision_score
-        elif metric.lower() == 'recall':
-            metric_dict['recall'] = metrics.recall_score
-            
-    return metric_dict
